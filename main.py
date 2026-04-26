@@ -8,12 +8,15 @@ from reportlab.lib import colors
 
 import requests
 import os
-import tempfile
 import html
 import re
+import uuid
 
 app = Flask(__name__)
 CORS(app)
+
+PDF_DIR = "/tmp/signalscript_pdfs"
+os.makedirs(PDF_DIR, exist_ok=True)
 
 
 @app.route("/", methods=["GET"])
@@ -21,13 +24,10 @@ def home():
     return "SignalScript API is running."
 
 
-# -------------------------
-# HELPERS
-# -------------------------
-
 def clean_filename(name):
     name = re.sub(r'[\\/*?:"<>|]', "", name)
-    return name[:80] if name else "transcript"
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:80] if name else "youtube_transcript_report"
 
 
 def seconds_to_timestamp(seconds):
@@ -37,7 +37,7 @@ def seconds_to_timestamp(seconds):
         m = (seconds % 3600) // 60
         s = seconds % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
-    except:
+    except Exception:
         return "00:00:00"
 
 
@@ -75,10 +75,6 @@ def transcript_to_plain(lines, max_chars=18000):
     return text[:max_chars]
 
 
-# -------------------------
-# GET VIDEO TITLE
-# -------------------------
-
 def get_video_title(url):
     try:
         res = requests.get(
@@ -89,75 +85,87 @@ def get_video_title(url):
         )
         data = res.json()
         return data.get("title", "YouTube Video Report")
-    except:
+    except Exception:
         return "YouTube Video Report"
 
-
-# -------------------------
-# AI SUMMARY
-# -------------------------
 
 def generate_ai_summary(lines):
     key = os.environ.get("OPENAI_API_KEY")
 
     if not key:
         return {
-            "summary": "Summary unavailable.",
+            "summary": "Summary unavailable because OPENAI_API_KEY is not set.",
             "takeaways": []
         }
 
     text = transcript_to_plain(lines)
 
     prompt = f"""
-Create a concise summary and 5 key takeaways.
+Create a concise summary and 5 key takeaways from this YouTube transcript.
+
+Return ONLY this format:
 
 SUMMARY:
-1 paragraph
+One concise paragraph.
 
 KEY TAKEAWAYS:
-- ...
-- ...
-- ...
-- ...
-- ...
+- takeaway 1
+- takeaway 2
+- takeaway 3
+- takeaway 4
+- takeaway 5
 
+Transcript:
 {text}
 """
 
-    r = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "gpt-4.1-mini",
-            "input": prompt
-        },
-        timeout=60
-    )
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
+                "input": prompt,
+                "store": False
+            },
+            timeout=60
+        )
 
-    out = r.json().get("output_text", "")
+        out = r.json().get("output_text", "")
 
-    summary = out
-    takeaways = []
+        if not out:
+            return {
+                "summary": "AI summary unavailable.",
+                "takeaways": []
+            }
 
-    if "KEY TAKEAWAYS:" in out:
-        parts = out.split("KEY TAKEAWAYS:")
-        summary = parts[0].replace("SUMMARY:", "").strip()
+        summary = out.replace("SUMMARY:", "").strip()
+        takeaways = []
 
-        takeaways = [
-            l.strip("- ").strip()
-            for l in parts[1].split("\n")
-            if l.strip().startswith("-")
-        ]
+        if "KEY TAKEAWAYS:" in out:
+            parts = out.split("KEY TAKEAWAYS:")
+            summary = parts[0].replace("SUMMARY:", "").strip()
 
-    return {"summary": summary, "takeaways": takeaways}
+            takeaways = [
+                l.strip("- ").strip()
+                for l in parts[1].split("\n")
+                if l.strip().startswith("-")
+            ]
 
+        return {
+            "summary": summary,
+            "takeaways": takeaways
+        }
 
-# -------------------------
-# PDF
-# -------------------------
+    except Exception:
+        return {
+            "summary": "AI summary unavailable.",
+            "takeaways": []
+        }
+
 
 def footer(canvas, doc):
     canvas.saveState()
@@ -168,85 +176,101 @@ def footer(canvas, doc):
     canvas.restoreState()
 
 
-def create_pdf(transcript_data, title):
+def create_pdf(transcript_data, title, pdf_path):
     lines = normalize_transcript(transcript_data)
     ai = generate_ai_summary(lines)
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    path = tmp.name
-    tmp.close()
-
-    doc = SimpleDocTemplate(path, pagesize=letter)
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=letter,
+        rightMargin=50,
+        leftMargin=50,
+        topMargin=50,
+        bottomMargin=50
+    )
 
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "title",
+        "TitleStyle",
         parent=styles["Title"],
         fontSize=24,
         leading=30,
         spaceAfter=20
     )
 
-    subtitle = ParagraphStyle(
-        "sub",
+    subtitle_style = ParagraphStyle(
+        "SubtitleStyle",
         parent=styles["Normal"],
         fontSize=12,
         textColor=colors.grey,
         spaceAfter=20
     )
 
-    section = ParagraphStyle(
-        "section",
+    section_style = ParagraphStyle(
+        "SectionStyle",
         parent=styles["Heading2"],
         textColor=colors.blue,
         spaceAfter=10
     )
 
-    body = styles["Normal"]
+    body_style = ParagraphStyle(
+        "BodyStyle",
+        parent=styles["Normal"],
+        fontSize=10,
+        leading=15,
+        spaceAfter=8
+    )
+
+    timestamp_style = ParagraphStyle(
+        "TimestampStyle",
+        parent=styles["Heading4"],
+        textColor=colors.blue,
+        fontSize=9,
+        leading=12,
+        spaceAfter=3
+    )
 
     content = []
 
-    # COVER PAGE
     content.append(Spacer(1, 120))
     content.append(Paragraph(html.escape(title), title_style))
-    content.append(Paragraph("YouTube Transcript Report", subtitle))
+    content.append(Paragraph("YouTube Transcript Report", subtitle_style))
+    content.append(Paragraph("Summary • Key Takeaways • Timestamped Transcript", subtitle_style))
     content.append(PageBreak())
 
-    # SUMMARY
-    content.append(Paragraph("Summary", section))
-    content.append(Paragraph(html.escape(ai["summary"]), body))
+    content.append(Paragraph("Summary", section_style))
+    content.append(Paragraph(html.escape(ai["summary"]), body_style))
     content.append(Spacer(1, 10))
 
-    content.append(Paragraph("Key Takeaways", section))
-    for t in ai["takeaways"]:
-        content.append(Paragraph(f"• {html.escape(t)}", body))
+    content.append(Paragraph("Key Takeaways", section_style))
+
+    if ai["takeaways"]:
+        for t in ai["takeaways"]:
+            content.append(Paragraph(f"• {html.escape(t)}", body_style))
+    else:
+        content.append(Paragraph("No key takeaways were generated.", body_style))
 
     content.append(PageBreak())
 
-    # TRANSCRIPT
     content.append(Paragraph("Transcript", title_style))
 
     for l in lines:
         if l["timestamp"]:
-            content.append(Paragraph(l["timestamp"], styles["Heading4"]))
+            content.append(Paragraph(l["timestamp"], timestamp_style))
 
-        content.append(Paragraph(html.escape(l["text"]), body))
+        content.append(Paragraph(html.escape(l["text"]), body_style))
         content.append(Spacer(1, 6))
 
     doc.build(content, onFirstPage=footer, onLaterPages=footer)
 
-    return path
+    return pdf_path
 
-
-# -------------------------
-# ROUTE
-# -------------------------
 
 @app.route("/transcript", methods=["POST"])
 def transcript():
     data = request.get_json()
-    url = data.get("url")
+    url = data.get("url") if data else None
 
     if not url:
         return jsonify({"error": "Missing URL"}), 400
@@ -254,36 +278,64 @@ def transcript():
     try:
         key = os.environ.get("SUPADATA_API_KEY")
 
+        if not key:
+            return jsonify({"error": "Missing SUPADATA_API_KEY"}), 500
+
         r = requests.get(
             "https://api.supadata.ai/v1/youtube/transcript",
             params={"url": url},
-            headers={"x-api-key": key}
+            headers={"x-api-key": key},
+            timeout=60
         )
 
         result = r.json()
 
         if "transcript" in result:
-            data = result["transcript"]
+            transcript_data = result["transcript"]
         elif "content" in result:
-            data = result["content"]
+            transcript_data = result["content"]
         else:
-            return jsonify(result), 400
+            return jsonify({
+                "error": "Transcript unavailable",
+                "details": result
+            }), 400
 
         title = get_video_title(url)
+        safe_title = clean_filename(title)
+        file_id = str(uuid.uuid4())
+        filename = f"{safe_title}-{file_id}.pdf"
+        pdf_path = os.path.join(PDF_DIR, filename)
 
-        pdf = create_pdf(data, title)
+        create_pdf(transcript_data, title, pdf_path)
 
-        filename = clean_filename(title) + ".pdf"
+        base_url = os.environ.get("BASE_URL", request.host_url.rstrip("/"))
+        download_url = f"{base_url}/download/{filename}"
 
-        return send_file(
-            pdf,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/pdf"
-        )
+        return jsonify({
+            "message": "PDF report generated successfully.",
+            "title": title,
+            "filename": filename,
+            "download_url": download_url
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/download/<filename>", methods=["GET"])
+def download_pdf(filename):
+    safe_name = os.path.basename(filename)
+    pdf_path = os.path.join(PDF_DIR, safe_name)
+
+    if not os.path.exists(pdf_path):
+        return jsonify({"error": "PDF not found or expired. Please generate it again."}), 404
+
+    return send_file(
+        pdf_path,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype="application/pdf"
+    )
 
 
 if __name__ == "__main__":
