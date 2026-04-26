@@ -10,6 +10,7 @@ import requests
 import os
 import tempfile
 import html
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -20,6 +21,15 @@ def home():
     return "SignalScript API is running."
 
 
+# -------------------------
+# HELPERS
+# -------------------------
+
+def clean_filename(name):
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    return name[:80] if name else "transcript"
+
+
 def seconds_to_timestamp(seconds):
     try:
         seconds = int(float(seconds))
@@ -27,18 +37,18 @@ def seconds_to_timestamp(seconds):
         m = (seconds % 3600) // 60
         s = seconds % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
-    except Exception:
+    except:
         return "00:00:00"
 
 
-def normalize_transcript(transcript_data):
+def normalize_transcript(data):
     lines = []
 
-    if isinstance(transcript_data, list):
-        for item in transcript_data:
+    if isinstance(data, list):
+        for item in data:
             if isinstance(item, dict):
                 text = item.get("text") or item.get("content") or ""
-                start = item.get("start") or item.get("offset") or item.get("startTime") or 0
+                start = item.get("start") or item.get("offset") or 0
 
                 lines.append({
                     "timestamp": seconds_to_timestamp(start),
@@ -50,201 +60,188 @@ def normalize_transcript(transcript_data):
                     "text": str(item).strip()
                 })
     else:
-        for paragraph in str(transcript_data).split("\n"):
-            if paragraph.strip():
+        for p in str(data).split("\n"):
+            if p.strip():
                 lines.append({
                     "timestamp": "",
-                    "text": paragraph.strip()
+                    "text": p.strip()
                 })
 
-    return [line for line in lines if line["text"]]
+    return [l for l in lines if l["text"]]
 
 
-def transcript_to_plain_text(lines, max_chars=18000):
-    text = "\n".join([
-        f"[{line['timestamp']}] {line['text']}"
-        for line in lines
-    ])
+def transcript_to_plain(lines, max_chars=18000):
+    text = "\n".join([f"[{l['timestamp']}] {l['text']}" for l in lines])
     return text[:max_chars]
 
 
-def generate_ai_summary(lines):
-    openai_key = os.environ.get("OPENAI_API_KEY")
+# -------------------------
+# GET VIDEO TITLE
+# -------------------------
 
-    if not openai_key:
+def get_video_title(url):
+    try:
+        res = requests.get(
+            "https://api.supadata.ai/v1/youtube/video",
+            params={"url": url},
+            headers={"x-api-key": os.environ.get("SUPADATA_API_KEY")},
+            timeout=10
+        )
+        data = res.json()
+        return data.get("title", "YouTube Video Report")
+    except:
+        return "YouTube Video Report"
+
+
+# -------------------------
+# AI SUMMARY
+# -------------------------
+
+def generate_ai_summary(lines):
+    key = os.environ.get("OPENAI_API_KEY")
+
+    if not key:
         return {
-            "summary": "AI summary unavailable because OPENAI_API_KEY is not set.",
-            "takeaways": [
-                "Transcript PDF was generated successfully.",
-                "Add OPENAI_API_KEY in Render to enable AI summary and key takeaways."
-            ]
+            "summary": "Summary unavailable.",
+            "takeaways": []
         }
 
-    transcript_text = transcript_to_plain_text(lines)
+    text = transcript_to_plain(lines)
 
     prompt = f"""
-Create a clean executive summary and key takeaways from this YouTube transcript.
-
-Return ONLY this format:
+Create a concise summary and 5 key takeaways.
 
 SUMMARY:
-One concise paragraph.
+1 paragraph
 
 KEY TAKEAWAYS:
-- takeaway 1
-- takeaway 2
-- takeaway 3
-- takeaway 4
-- takeaway 5
+- ...
+- ...
+- ...
+- ...
+- ...
 
-Transcript:
-{transcript_text}
+{text}
 """
 
-    response = requests.post(
+    r = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
-            "Authorization": f"Bearer {openai_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         },
         json={
-            "model": os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
-            "input": prompt,
-            "store": False
+            "model": "gpt-4.1-mini",
+            "input": prompt
         },
         timeout=60
     )
 
-    result = response.json()
-    output_text = result.get("output_text", "")
+    out = r.json().get("output_text", "")
 
-    if not output_text:
-        return {
-            "summary": "AI summary unavailable.",
-            "takeaways": [
-                "The transcript was successfully exported.",
-                "The AI summary could not be generated from the current response."
-            ]
-        }
-
-    summary = output_text.replace("SUMMARY:", "").strip()
+    summary = out
     takeaways = []
 
-    if "KEY TAKEAWAYS:" in output_text:
-        parts = output_text.split("KEY TAKEAWAYS:")
+    if "KEY TAKEAWAYS:" in out:
+        parts = out.split("KEY TAKEAWAYS:")
         summary = parts[0].replace("SUMMARY:", "").strip()
 
         takeaways = [
-            line.strip("- ").strip()
-            for line in parts[1].split("\n")
-            if line.strip().startswith("-")
+            l.strip("- ").strip()
+            for l in parts[1].split("\n")
+            if l.strip().startswith("-")
         ]
 
-    return {
-        "summary": summary,
-        "takeaways": takeaways
-    }
+    return {"summary": summary, "takeaways": takeaways}
 
 
-def pdf_footer(canvas, doc):
+# -------------------------
+# PDF
+# -------------------------
+
+def footer(canvas, doc):
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
-    canvas.setFillColor(colors.HexColor("#5A5A5A"))
-    canvas.drawString(50, 28, "SignalScript Transcript Report")
+    canvas.setFillColor(colors.grey)
+    canvas.drawString(50, 28, "SignalScript Report")
     canvas.drawRightString(562, 28, f"Page {doc.page}")
     canvas.restoreState()
 
 
-def create_transcript_pdf(transcript_data):
+def create_pdf(transcript_data, title):
     lines = normalize_transcript(transcript_data)
     ai = generate_ai_summary(lines)
 
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf_path = temp_file.name
-    temp_file.close()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    path = tmp.name
+    tmp.close()
 
-    doc = SimpleDocTemplate(
-        pdf_path,
-        pagesize=letter,
-        rightMargin=50,
-        leftMargin=50,
-        topMargin=50,
-        bottomMargin=50
-    )
+    doc = SimpleDocTemplate(path, pagesize=letter)
 
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "TitleStyle",
+        "title",
         parent=styles["Title"],
-        fontName="Helvetica-Bold",
         fontSize=24,
         leading=30,
-        textColor=colors.HexColor("#080808"),
         spaceAfter=20
     )
 
-    section_style = ParagraphStyle(
-        "SectionStyle",
+    subtitle = ParagraphStyle(
+        "sub",
+        parent=styles["Normal"],
+        fontSize=12,
+        textColor=colors.grey,
+        spaceAfter=20
+    )
+
+    section = ParagraphStyle(
+        "section",
         parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        leading=20,
-        textColor=colors.HexColor("#146EF5"),
-        spaceBefore=12,
+        textColor=colors.blue,
         spaceAfter=10
     )
 
-    body_style = ParagraphStyle(
-        "BodyStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=10,
-        leading=15,
-        textColor=colors.HexColor("#171717"),
-        spaceAfter=8
-    )
-
-    timestamp_style = ParagraphStyle(
-        "TimestampStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=9,
-        leading=14,
-        textColor=colors.HexColor("#146EF5")
-    )
+    body = styles["Normal"]
 
     content = []
 
-    content.append(Paragraph("SignalScript Transcript Report", title_style))
+    # COVER PAGE
+    content.append(Spacer(1, 120))
+    content.append(Paragraph(html.escape(title), title_style))
+    content.append(Paragraph("YouTube Transcript Report", subtitle))
+    content.append(PageBreak())
 
-    content.append(Paragraph("AI Summary", section_style))
-    content.append(Paragraph(html.escape(ai["summary"]), body_style))
-
+    # SUMMARY
+    content.append(Paragraph("Summary", section))
+    content.append(Paragraph(html.escape(ai["summary"]), body))
     content.append(Spacer(1, 10))
-    content.append(Paragraph("Key Takeaways", section_style))
 
-    for takeaway in ai["takeaways"]:
-        content.append(Paragraph(f"• {html.escape(takeaway)}", body_style))
+    content.append(Paragraph("Key Takeaways", section))
+    for t in ai["takeaways"]:
+        content.append(Paragraph(f"• {html.escape(t)}", body))
 
     content.append(PageBreak())
-    content.append(Paragraph("Full Transcript", title_style))
 
-    for line in lines:
-        if line["timestamp"]:
-            content.append(Paragraph(line["timestamp"], timestamp_style))
+    # TRANSCRIPT
+    content.append(Paragraph("Transcript", title_style))
 
-        content.append(Paragraph(html.escape(line["text"]), body_style))
-        content.append(Spacer(1, 4))
+    for l in lines:
+        if l["timestamp"]:
+            content.append(Paragraph(l["timestamp"], styles["Heading4"]))
 
-    doc.build(
-        content,
-        onFirstPage=pdf_footer,
-        onLaterPages=pdf_footer
-    )
+        content.append(Paragraph(html.escape(l["text"]), body))
+        content.append(Spacer(1, 6))
 
-    return pdf_path
+    doc.build(content, onFirstPage=footer, onLaterPages=footer)
 
+    return path
+
+
+# -------------------------
+# ROUTE
+# -------------------------
 
 @app.route("/transcript", methods=["POST"])
 def transcript():
@@ -252,46 +249,41 @@ def transcript():
     url = data.get("url")
 
     if not url:
-        return jsonify({"error": "Missing YouTube URL"}), 400
+        return jsonify({"error": "Missing URL"}), 400
 
     try:
-        api_key = os.environ.get("SUPADATA_API_KEY")
+        key = os.environ.get("SUPADATA_API_KEY")
 
-        if not api_key:
-            return jsonify({"error": "Missing SUPADATA_API_KEY"}), 500
-
-        response = requests.get(
+        r = requests.get(
             "https://api.supadata.ai/v1/youtube/transcript",
             params={"url": url},
-            headers={"x-api-key": api_key},
-            timeout=60
+            headers={"x-api-key": key}
         )
 
-        result = response.json()
+        result = r.json()
 
         if "transcript" in result:
-            transcript_data = result["transcript"]
+            data = result["transcript"]
         elif "content" in result:
-            transcript_data = result["content"]
+            data = result["content"]
         else:
-            return jsonify({
-                "error": "Transcript unavailable",
-                "details": result
-            }), 400
+            return jsonify(result), 400
 
-        pdf_path = create_transcript_pdf(transcript_data)
+        title = get_video_title(url)
+
+        pdf = create_pdf(data, title)
+
+        filename = clean_filename(title) + ".pdf"
 
         return send_file(
-            pdf_path,
+            pdf,
             as_attachment=True,
-            download_name="signalscript_transcript_report.pdf",
+            download_name=filename,
             mimetype="application/pdf"
         )
 
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 400
+        return jsonify({"error": str(e)}), 400
 
 
 if __name__ == "__main__":
