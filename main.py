@@ -45,10 +45,7 @@ def get_video_title(url):
     try:
         res = requests.get(
             "https://www.youtube.com/oembed",
-            params={
-                "url": url,
-                "format": "json"
-            },
+            params={"url": url, "format": "json"},
             timeout=10
         )
         data = res.json()
@@ -66,11 +63,13 @@ def normalize_transcript(data):
                 text = item.get("text") or item.get("content") or ""
                 start = item.get("start") or item.get("offset") or 0
 
-                # Supadata may return milliseconds. Convert if large.
                 try:
                     start_num = float(start)
+
+                    # Supadata may return milliseconds instead of seconds.
                     if start_num > 10000:
                         start_num = start_num / 1000
+
                 except Exception:
                     start_num = 0
 
@@ -79,22 +78,24 @@ def normalize_transcript(data):
                     "start": start_num,
                     "text": str(text).strip()
                 })
+
             else:
                 lines.append({
                     "timestamp": "",
                     "start": 0,
                     "text": str(item).strip()
                 })
+
     else:
-        for p in str(data).split("\n"):
-            if p.strip():
+        for paragraph in str(data).split("\n"):
+            if paragraph.strip():
                 lines.append({
                     "timestamp": "",
                     "start": 0,
-                    "text": p.strip()
+                    "text": paragraph.strip()
                 })
 
-    return [l for l in lines if l["text"]]
+    return [line for line in lines if line["text"]]
 
 
 def group_transcript(lines, max_words=90):
@@ -116,11 +117,12 @@ def group_transcript(lines, max_words=90):
         ends_sentence = text.endswith((".", "?", "!"))
         enough_words = word_count >= max_words
 
-        if ends_sentence and word_count >= 35 or enough_words:
+        if (ends_sentence and word_count >= 35) or enough_words:
             grouped.append({
                 "timestamp": seconds_to_timestamp(current_start),
                 "text": " ".join(current_text)
             })
+
             current_text = []
             current_start = None
             word_count = 0
@@ -135,14 +137,37 @@ def group_transcript(lines, max_words=90):
 
 
 def transcript_to_plain(grouped, max_chars=22000):
-    text = "\n\n".join([f"[{g['timestamp']}] {g['text']}" for g in grouped])
+    text = "\n\n".join([
+        f"[{item['timestamp']}] {item['text']}"
+        for item in grouped
+    ])
+
     return text[:max_chars]
 
 
-def generate_ai_summary(grouped):
-    key = os.environ.get("OPENAI_API_KEY")
+def extract_openai_text(result):
+    """
+    Safely extracts text from OpenAI Responses API output.
+    """
 
-    if not key:
+    if result.get("output_text"):
+        return result.get("output_text", "")
+
+    output_text = ""
+
+    for item in result.get("output", []):
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    output_text += content.get("text", "")
+
+    return output_text.strip()
+
+
+def generate_ai_summary(grouped):
+    openai_key = os.environ.get("OPENAI_API_KEY")
+
+    if not openai_key:
         return {
             "summary": "AI summary unavailable because OPENAI_API_KEY is not set in Render.",
             "takeaways": [
@@ -173,10 +198,10 @@ Transcript:
 """
 
     try:
-        r = requests.post(
+        response = requests.post(
             "https://api.openai.com/v1/responses",
             headers={
-                "Authorization": f"Bearer {key}",
+                "Authorization": f"Bearer {openai_key}",
                 "Content-Type": "application/json"
             },
             json={
@@ -187,10 +212,10 @@ Transcript:
             timeout=60
         )
 
-        result = r.json()
-        out = result.get("output_text", "")
+        result = response.json()
+        output_text = extract_openai_text(result)
 
-        if not out:
+        if not output_text:
             return {
                 "summary": "AI summary unavailable from the model response.",
                 "takeaways": [
@@ -199,11 +224,11 @@ Transcript:
                 ]
             }
 
-        summary = out.replace("SUMMARY:", "").strip()
+        summary = output_text.replace("SUMMARY:", "").strip()
         takeaways = []
 
-        if "KEY TAKEAWAYS:" in out:
-            parts = out.split("KEY TAKEAWAYS:")
+        if "KEY TAKEAWAYS:" in output_text:
+            parts = output_text.split("KEY TAKEAWAYS:")
             summary = parts[0].replace("SUMMARY:", "").strip()
 
             takeaways = [
@@ -311,27 +336,31 @@ def create_pdf(transcript_data, title, pdf_path):
 
     content = []
 
+    # Cover page
     content.append(Spacer(1, 120))
     content.append(Paragraph(html.escape(title), title_style))
     content.append(Paragraph("YouTube Transcript Report", subtitle_style))
     content.append(Paragraph("Summary • Key Takeaways • Readable Timestamped Transcript", subtitle_style))
     content.append(PageBreak())
 
+    # Summary page
     content.append(Paragraph("Summary", section_style))
     content.append(Paragraph(html.escape(ai["summary"]), body_style))
     content.append(Spacer(1, 10))
 
     content.append(Paragraph("Key Takeaways", section_style))
-    for t in ai["takeaways"]:
-        content.append(Paragraph(f"• {html.escape(t)}", body_style))
+
+    for takeaway in ai["takeaways"]:
+        content.append(Paragraph(f"• {html.escape(takeaway)}", body_style))
 
     content.append(PageBreak())
 
+    # Transcript page
     content.append(Paragraph("Transcript", title_style))
 
-    for g in grouped:
-        content.append(Paragraph(g["timestamp"], timestamp_style))
-        content.append(Paragraph(html.escape(g["text"]), body_style))
+    for item in grouped:
+        content.append(Paragraph(item["timestamp"], timestamp_style))
+        content.append(Paragraph(html.escape(item["text"]), body_style))
         content.append(Spacer(1, 6))
 
     doc.build(content, onFirstPage=footer, onLaterPages=footer)
@@ -348,24 +377,26 @@ def transcript():
         return jsonify({"error": "Missing URL"}), 400
 
     try:
-        key = os.environ.get("SUPADATA_API_KEY")
+        supadata_key = os.environ.get("SUPADATA_API_KEY")
 
-        if not key:
+        if not supadata_key:
             return jsonify({"error": "Missing SUPADATA_API_KEY"}), 500
 
-        r = requests.get(
+        response = requests.get(
             "https://api.supadata.ai/v1/youtube/transcript",
             params={"url": url},
-            headers={"x-api-key": key},
+            headers={"x-api-key": supadata_key},
             timeout=60
         )
 
-        result = r.json()
+        result = response.json()
 
         if "transcript" in result:
             transcript_data = result["transcript"]
+
         elif "content" in result:
             transcript_data = result["content"]
+
         else:
             return jsonify({
                 "error": "Transcript unavailable",
@@ -375,6 +406,7 @@ def transcript():
         title = get_video_title(url)
         safe_title = clean_filename(title)
         file_id = str(uuid.uuid4())
+
         filename = f"{safe_title}-{file_id}.pdf"
         pdf_path = os.path.join(PDF_DIR, filename)
 
@@ -400,7 +432,9 @@ def download_pdf(filename):
     pdf_path = os.path.join(PDF_DIR, safe_name)
 
     if not os.path.exists(pdf_path):
-        return jsonify({"error": "PDF not found or expired. Please generate it again."}), 404
+        return jsonify({
+            "error": "PDF not found or expired. Please generate it again."
+        }), 404
 
     return send_file(
         pdf_path,
