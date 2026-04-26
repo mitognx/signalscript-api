@@ -2,3 +2,4 @@ flask
 flask-cors
 requests
 youtube-transcript-api
+reportlab
