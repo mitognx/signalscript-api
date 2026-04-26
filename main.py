@@ -56,7 +56,6 @@ def create_transcript_pdf(transcript_text):
                 content.append(Spacer(1, 10))
 
     doc.build(content)
-
     return pdf_path
 
 
@@ -83,19 +82,23 @@ def transcript():
         result = response.json()
 
         if "transcript" in result:
-            pdf_path = create_transcript_pdf(result["transcript"])
+            transcript_data = result["transcript"]
+        elif "content" in result:
+            transcript_data = result["content"]
+        else:
+            return jsonify({
+                "error": "Transcript unavailable",
+                "details": result
+            }), 400
 
-            return send_file(
-                pdf_path,
-                as_attachment=True,
-                download_name="youtube_transcript.pdf",
-                mimetype="application/pdf"
-            )
+        pdf_path = create_transcript_pdf(transcript_data)
 
-        return jsonify({
-            "error": "Transcript unavailable",
-            "details": result
-        }), 400
+        return send_file(
+            pdf_path,
+            as_attachment=True,
+            download_name="youtube_transcript.pdf",
+            mimetype="application/pdf"
+        )
 
     except Exception as e:
         return jsonify({
