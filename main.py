@@ -41,6 +41,22 @@ def seconds_to_timestamp(seconds):
         return "00:00:00"
 
 
+def get_video_title(url):
+    try:
+        res = requests.get(
+            "https://www.youtube.com/oembed",
+            params={
+                "url": url,
+                "format": "json"
+            },
+            timeout=10
+        )
+        data = res.json()
+        return data.get("title", "YouTube Transcript Report")
+    except Exception:
+        return "YouTube Transcript Report"
+
+
 def normalize_transcript(data):
     lines = []
 
@@ -50,13 +66,23 @@ def normalize_transcript(data):
                 text = item.get("text") or item.get("content") or ""
                 start = item.get("start") or item.get("offset") or 0
 
+                # Supadata may return milliseconds. Convert if large.
+                try:
+                    start_num = float(start)
+                    if start_num > 10000:
+                        start_num = start_num / 1000
+                except Exception:
+                    start_num = 0
+
                 lines.append({
-                    "timestamp": seconds_to_timestamp(start),
+                    "timestamp": seconds_to_timestamp(start_num),
+                    "start": start_num,
                     "text": str(text).strip()
                 })
             else:
                 lines.append({
                     "timestamp": "",
+                    "start": 0,
                     "text": str(item).strip()
                 })
     else:
@@ -64,59 +90,86 @@ def normalize_transcript(data):
             if p.strip():
                 lines.append({
                     "timestamp": "",
+                    "start": 0,
                     "text": p.strip()
                 })
 
     return [l for l in lines if l["text"]]
 
 
-def transcript_to_plain(lines, max_chars=18000):
-    text = "\n".join([f"[{l['timestamp']}] {l['text']}" for l in lines])
+def group_transcript(lines, max_words=90):
+    grouped = []
+    current_text = []
+    current_start = None
+    word_count = 0
+
+    for line in lines:
+        text = line["text"]
+        words = text.split()
+
+        if current_start is None:
+            current_start = line["start"]
+
+        current_text.append(text)
+        word_count += len(words)
+
+        ends_sentence = text.endswith((".", "?", "!"))
+        enough_words = word_count >= max_words
+
+        if ends_sentence and word_count >= 35 or enough_words:
+            grouped.append({
+                "timestamp": seconds_to_timestamp(current_start),
+                "text": " ".join(current_text)
+            })
+            current_text = []
+            current_start = None
+            word_count = 0
+
+    if current_text:
+        grouped.append({
+            "timestamp": seconds_to_timestamp(current_start or 0),
+            "text": " ".join(current_text)
+        })
+
+    return grouped
+
+
+def transcript_to_plain(grouped, max_chars=22000):
+    text = "\n\n".join([f"[{g['timestamp']}] {g['text']}" for g in grouped])
     return text[:max_chars]
 
 
-def get_video_title(url):
-    try:
-        res = requests.get(
-            "https://api.supadata.ai/v1/youtube/video",
-            params={"url": url},
-            headers={"x-api-key": os.environ.get("SUPADATA_API_KEY")},
-            timeout=10
-        )
-        data = res.json()
-        return data.get("title", "YouTube Video Report")
-    except Exception:
-        return "YouTube Video Report"
-
-
-def generate_ai_summary(lines):
+def generate_ai_summary(grouped):
     key = os.environ.get("OPENAI_API_KEY")
 
     if not key:
         return {
-            "summary": "Summary unavailable because OPENAI_API_KEY is not set.",
-            "takeaways": []
+            "summary": "AI summary unavailable because OPENAI_API_KEY is not set in Render.",
+            "takeaways": [
+                "The transcript PDF was generated successfully.",
+                "Add OPENAI_API_KEY in Render to enable summary and key takeaways."
+            ]
         }
 
-    text = transcript_to_plain(lines)
+    transcript_text = transcript_to_plain(grouped)
 
     prompt = f"""
-Create a concise summary and 5 key takeaways from this YouTube transcript.
+Create a concise executive summary and 5 useful key takeaways from this YouTube transcript.
 
-Return ONLY this format:
+Return ONLY this exact format:
 
 SUMMARY:
-One concise paragraph.
+One clear paragraph.
 
 KEY TAKEAWAYS:
-- takeaway 1
-- takeaway 2
-- takeaway 3
-- takeaway 4
-- takeaway 5
+- Takeaway 1
+- Takeaway 2
+- Takeaway 3
+- Takeaway 4
+- Takeaway 5
 
 Transcript:
-{text}
+{transcript_text}
 """
 
     try:
@@ -134,12 +187,16 @@ Transcript:
             timeout=60
         )
 
-        out = r.json().get("output_text", "")
+        result = r.json()
+        out = result.get("output_text", "")
 
         if not out:
             return {
-                "summary": "AI summary unavailable.",
-                "takeaways": []
+                "summary": "AI summary unavailable from the model response.",
+                "takeaways": [
+                    "The transcript was generated successfully.",
+                    "The AI summary step returned an empty response."
+                ]
             }
 
         summary = out.replace("SUMMARY:", "").strip()
@@ -150,9 +207,16 @@ Transcript:
             summary = parts[0].replace("SUMMARY:", "").strip()
 
             takeaways = [
-                l.strip("- ").strip()
-                for l in parts[1].split("\n")
-                if l.strip().startswith("-")
+                line.strip("- ").strip()
+                for line in parts[1].split("\n")
+                if line.strip().startswith("-")
+            ]
+
+        if not takeaways:
+            takeaways = [
+                "The transcript was generated successfully.",
+                "The video content has been organized into a readable report.",
+                "The full timestamped transcript is included after the summary section."
             ]
 
         return {
@@ -160,10 +224,13 @@ Transcript:
             "takeaways": takeaways
         }
 
-    except Exception:
+    except Exception as e:
         return {
-            "summary": "AI summary unavailable.",
-            "takeaways": []
+            "summary": f"AI summary unavailable: {str(e)}",
+            "takeaways": [
+                "The transcript PDF was generated successfully.",
+                "The AI summary step failed, but the transcript is included."
+            ]
         }
 
 
@@ -177,16 +244,17 @@ def footer(canvas, doc):
 
 
 def create_pdf(transcript_data, title, pdf_path):
-    lines = normalize_transcript(transcript_data)
-    ai = generate_ai_summary(lines)
+    raw_lines = normalize_transcript(transcript_data)
+    grouped = group_transcript(raw_lines)
+    ai = generate_ai_summary(grouped)
 
     doc = SimpleDocTemplate(
         pdf_path,
         pagesize=letter,
-        rightMargin=50,
-        leftMargin=50,
-        topMargin=50,
-        bottomMargin=50
+        rightMargin=55,
+        leftMargin=55,
+        topMargin=55,
+        bottomMargin=55
     )
 
     styles = getSampleStyleSheet()
@@ -194,40 +262,50 @@ def create_pdf(transcript_data, title, pdf_path):
     title_style = ParagraphStyle(
         "TitleStyle",
         parent=styles["Title"],
+        fontName="Helvetica-Bold",
         fontSize=24,
         leading=30,
-        spaceAfter=20
+        alignment=1,
+        spaceAfter=22
     )
 
     subtitle_style = ParagraphStyle(
         "SubtitleStyle",
         parent=styles["Normal"],
         fontSize=12,
+        leading=18,
         textColor=colors.grey,
-        spaceAfter=20
+        alignment=1,
+        spaceAfter=14
     )
 
     section_style = ParagraphStyle(
         "SectionStyle",
         parent=styles["Heading2"],
-        textColor=colors.blue,
-        spaceAfter=10
+        fontName="Helvetica-Bold",
+        fontSize=16,
+        leading=22,
+        textColor=colors.HexColor("#146EF5"),
+        spaceBefore=8,
+        spaceAfter=12
     )
 
     body_style = ParagraphStyle(
         "BodyStyle",
         parent=styles["Normal"],
-        fontSize=10,
-        leading=15,
-        spaceAfter=8
+        fontSize=10.5,
+        leading=16,
+        spaceAfter=10
     )
 
     timestamp_style = ParagraphStyle(
         "TimestampStyle",
-        parent=styles["Heading4"],
-        textColor=colors.blue,
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
         fontSize=9,
         leading=12,
+        textColor=colors.HexColor("#146EF5"),
+        spaceBefore=8,
         spaceAfter=3
     )
 
@@ -236,7 +314,7 @@ def create_pdf(transcript_data, title, pdf_path):
     content.append(Spacer(1, 120))
     content.append(Paragraph(html.escape(title), title_style))
     content.append(Paragraph("YouTube Transcript Report", subtitle_style))
-    content.append(Paragraph("Summary • Key Takeaways • Timestamped Transcript", subtitle_style))
+    content.append(Paragraph("Summary • Key Takeaways • Readable Timestamped Transcript", subtitle_style))
     content.append(PageBreak())
 
     content.append(Paragraph("Summary", section_style))
@@ -244,22 +322,16 @@ def create_pdf(transcript_data, title, pdf_path):
     content.append(Spacer(1, 10))
 
     content.append(Paragraph("Key Takeaways", section_style))
-
-    if ai["takeaways"]:
-        for t in ai["takeaways"]:
-            content.append(Paragraph(f"• {html.escape(t)}", body_style))
-    else:
-        content.append(Paragraph("No key takeaways were generated.", body_style))
+    for t in ai["takeaways"]:
+        content.append(Paragraph(f"• {html.escape(t)}", body_style))
 
     content.append(PageBreak())
 
     content.append(Paragraph("Transcript", title_style))
 
-    for l in lines:
-        if l["timestamp"]:
-            content.append(Paragraph(l["timestamp"], timestamp_style))
-
-        content.append(Paragraph(html.escape(l["text"]), body_style))
+    for g in grouped:
+        content.append(Paragraph(g["timestamp"], timestamp_style))
+        content.append(Paragraph(html.escape(g["text"]), body_style))
         content.append(Spacer(1, 6))
 
     doc.build(content, onFirstPage=footer, onLaterPages=footer)
